@@ -1,0 +1,33 @@
+name: XAUUSD Signal Bot
+
+on:
+  schedule:
+    # Phút 1, 16, 31, 46 mỗi giờ, từ Thứ 2 đến Thứ 6 (giờ UTC)
+    - cron: "1,16,31,46 * * * 1-5"
+  workflow_dispatch:   # Cho phép bấm chạy thử bằng tay
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Cài thư viện
+        run: pip install -r requirements.txt
+
+      - name: Chạy bot 1 lần
+        run: python bot.py
+        env:
+          RUN_ONCE: "true"
+          LLM_PROVIDER: "gemini"
+          GEMINI_MODEL: "gemini-2.5-flash"
+          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
