@@ -1,9 +1,6 @@
 name: XAUUSD Signal Bot
 
 on:
-  schedule:
-    # Phút 1, 16, 31, 46 mỗi giờ, từ Thứ 2 đến Thứ 6 (giờ UTC)
-    - cron: "1,16,31,46 * * * 1-5"
   workflow_dispatch:   # Cho phép bấm chạy thử bằng tay
 
 jobs:
