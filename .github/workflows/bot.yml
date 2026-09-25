@@ -26,7 +26,7 @@ jobs:
         env:
           RUN_ONCE: "true"
           LLM_PROVIDER: "gemini"
-          GEMINI_MODEL: "gemini-3.8-flash"
+          GEMINI_MODEL: "gemini-3.8-flash,gemini-3.7-flash,gemini-3.5-flash-lite"
           TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
