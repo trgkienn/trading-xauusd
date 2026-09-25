@@ -3,7 +3,7 @@
 bot.py - Bot tín hiệu XAUUSD (Vàng) chạy trên PythonAnywhere
 
 Luồng hoạt động (mỗi 15 phút, ngay sau khi nến M15 đóng):
-    1. Lấy OHLC các nến M15 gần nhất của XAU/USD từ Twelve Data
+    1. Lấy OHLC nến M15 (ngắn hạn) và H1 (xu hướng chính) của XAU/USD từ Twelve Data
     2. Định dạng thành bảng văn bản
     3. Gửi cho AI (Gemini miễn phí / Anthropic / OpenAI) kèm System Prompt
     4. Gửi kết quả về Telegram (parse_mode=HTML)
@@ -46,16 +46,20 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 # Chọn nhà cung cấp AI: "gemini" (miễn phí), "anthropic" hoặc "openai"
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 
 SYMBOL = "XAU/USD"
-INTERVAL = "15min"
-CANDLE_MINUTES = 15
+
+# Khung ngắn hạn M15: tìm điểm vào lệnh, mô hình nến
 CANDLE_COUNT = int(os.getenv("CANDLE_COUNT", "10"))
+# Khung H1: xác định xu hướng chính và vùng cản (50 nến ~ 2 ngày giao dịch)
+H1_CANDLE_COUNT = int(os.getenv("H1_CANDLE_COUNT", "50"))
+
+# Mỗi chu kỳ gọi Twelve Data 2 lần (M15 + H1) -> ~192 credit/ngày, gói free có 800
 
 # true  = gửi cả tín hiệu WAIT lên Telegram
 # false = chỉ gửi khi có BUY/SELL (đỡ spam)
@@ -86,7 +90,8 @@ Nhiệm vụ của bạn là tiếp nhận dữ liệu giá OHLC, phân tích xu
 [QUY ƯỚC BẮT BUỘC]
 - 1 pip XAUUSD = 0.10 USD biến động giá (VD: giá đi từ 2650.00 lên 2651.00 = 10 pips).
 - 0.01 lot = 1 ounce, giá trị 0.10 USD mỗi pip.
-- Dữ liệu được cung cấp là nến M15 đã đóng. Xu hướng H1/H4 chỉ được ước lượng từ dữ liệu này; nếu dữ liệu không đủ để kết luận, hãy nói rõ và ưu tiên WAIT.
+- Dữ liệu được cung cấp gồm 2 bảng nến đã đóng: H1 (xác định xu hướng chính, vùng kháng cự/hỗ trợ, đỉnh/đáy quan trọng) và M15 (xác định mô hình nến và điểm vào lệnh). Xu hướng H4 được ước lượng bằng cách gộp 4 nến H1 liên tiếp.
+- Nếu thiếu bảng H1, hãy nói rõ trong phần phân tích, chỉ dựa vào M15 và ưu tiên WAIT.
 - Dùng đúng thời gian hiện tại được cung cấp trong tin nhắn, không tự bịa thời gian.
 
 ---
@@ -203,21 +208,25 @@ def http_request(method, url, name, **kwargs):
 # =============================================================================
 # BƯỚC 1: LẤY DỮ LIỆU NẾN TỪ TWELVE DATA
 # =============================================================================
-def fetch_candles():
+def fetch_candles(interval, count, candle_minutes):
     """
-    Lấy các nến M15 ĐÃ ĐÓNG gần nhất của XAU/USD.
+    Lấy các nến ĐÃ ĐÓNG gần nhất của XAU/USD cho một khung thời gian.
+        interval       : "15min", "1h", ... (theo chuẩn Twelve Data)
+        count          : số nến cần lấy
+        candle_minutes : độ dài 1 nến tính bằng phút (dùng để loại nến chưa đóng)
     Trả về list dict [{time, open, high, low, close}] sắp xếp cũ -> mới, hoặc None nếu lỗi.
     """
+    name = f"TwelveData {interval}"
     try:
         resp = http_request(
             "GET",
             "https://api.twelvedata.com/time_series",
-            "TwelveData",
+            name,
             params={
                 "symbol": SYMBOL,
-                "interval": INTERVAL,
+                "interval": interval,
                 # Lấy dư 1 nến để còn đủ số lượng sau khi bỏ nến đang hình thành
-                "outputsize": CANDLE_COUNT + 1,
+                "outputsize": count + 1,
                 "timezone": "UTC",
                 "apikey": TWELVE_DATA_API_KEY,
             },
@@ -228,8 +237,8 @@ def fetch_candles():
         data = resp.json()
         if data.get("status") != "ok":
             # VD: hết credit, sai API key, sai symbol...
-            log.error("[TwelveData] API báo lỗi: code=%s, message=%s",
-                      data.get("code"), data.get("message"))
+            log.error("[%s] API báo lỗi: code=%s, message=%s",
+                      name, data.get("code"), data.get("message"))
             return None
 
         candles = []
@@ -248,22 +257,22 @@ def fetch_candles():
 
         # Loại nến chưa đóng (thời điểm mở + 15 phút > hiện tại)
         now = datetime.now(timezone.utc)
-        candles = [c for c in candles if c["time"] + timedelta(minutes=CANDLE_MINUTES) <= now]
+        candles = [c for c in candles if c["time"] + timedelta(minutes=candle_minutes) <= now]
 
-        candles = candles[-CANDLE_COUNT:]
+        candles = candles[-count:]
         if not candles:
-            log.warning("[TwelveData] Không có nến đã đóng nào trong dữ liệu trả về.")
+            log.warning("[%s] Không có nến đã đóng nào trong dữ liệu trả về.", name)
             return None
 
-        log.info("[TwelveData] Lấy được %d nến, nến cuối mở lúc %s UTC",
-                 len(candles), candles[-1]["time"].strftime("%Y-%m-%d %H:%M"))
+        log.info("[%s] Lấy được %d nến, nến cuối mở lúc %s UTC",
+                 name, len(candles), candles[-1]["time"].strftime("%Y-%m-%d %H:%M"))
         return candles
 
     except (ValueError, KeyError, TypeError) as e:
-        log.error("[TwelveData] Dữ liệu trả về không đúng định dạng: %s", e)
+        log.error("[%s] Dữ liệu trả về không đúng định dạng: %s", name, e)
         return None
     except Exception:
-        log.exception("[TwelveData] Lỗi không mong muốn")
+        log.exception("[%s] Lỗi không mong muốn", name)
         return None
 
 
@@ -279,14 +288,20 @@ def format_candles(candles):
 # =============================================================================
 # BƯỚC 2: GỬI DỮ LIỆU CHO AI PHÂN TÍCH
 # =============================================================================
-def build_user_message(candle_text):
-    """Tạo nội dung tin nhắn gửi AI: thời gian hiện tại + bảng nến."""
+def build_user_message(m15_text, h1_text):
+    """Tạo nội dung tin nhắn gửi AI: thời gian hiện tại + bảng nến H1 + bảng nến M15."""
     now_vn = datetime.now(VN_TZ).strftime("%H:%M %d/%m/%Y (GMT+7)")
+    if h1_text:
+        h1_block = f"=== KHUNG H1 ({H1_CANDLE_COUNT} nến đã đóng, cũ -> mới) ===\n{h1_text}"
+    else:
+        h1_block = "=== KHUNG H1 ===\n(Không lấy được dữ liệu H1 ở chu kỳ này)"
     return (
         f"Thời gian hiện tại: {now_vn}\n"
-        f"Cặp: XAUUSD | Khung: M15 | {CANDLE_COUNT} nến đã đóng gần nhất (cũ -> mới):\n\n"
-        f"{candle_text}\n\n"
-        "Hãy phân tích theo đúng 4 bước và trả về tín hiệu theo mẫu HTML đã quy định."
+        f"Cặp: XAUUSD\n\n"
+        f"{h1_block}\n\n"
+        f"=== KHUNG M15 ({CANDLE_COUNT} nến đã đóng, cũ -> mới) ===\n{m15_text}\n\n"
+        "Hãy phân tích theo đúng 4 bước: dùng H1 để xác định xu hướng chính và vùng cản, "
+        "dùng M15 để tìm mô hình nến và điểm vào lệnh. Trả về tín hiệu theo mẫu HTML đã quy định."
     )
 
 
@@ -422,9 +437,9 @@ def clean_ai_output(text):
     return text.strip()
 
 
-def analyze_with_ai(candle_text):
+def analyze_with_ai(m15_text, h1_text):
     """Chọn nhà cung cấp AI theo cấu hình và trả về tín hiệu đã làm sạch."""
-    user_message = build_user_message(candle_text)
+    user_message = build_user_message(m15_text, h1_text)
     if LLM_PROVIDER == "openai":
         result = call_openai(user_message)
     elif LLM_PROVIDER == "anthropic":
@@ -507,21 +522,32 @@ def job():
     try:
         log.info("===== Bắt đầu chu kỳ phân tích =====")
 
-        candles = fetch_candles()
-        if not candles:
-            log.warning("Không có dữ liệu nến, bỏ qua chu kỳ này.")
+        # M15 là bắt buộc: không có thì bỏ qua chu kỳ
+        m15 = fetch_candles("15min", CANDLE_COUNT, 15)
+        if not m15:
+            log.warning("Không có dữ liệu nến M15, bỏ qua chu kỳ này.")
             return
 
-        # Nếu nến cuối không đổi (cuối tuần / thị trường đóng cửa) thì không phân tích lại
-        newest = candles[-1]["time"]
+        # Nếu nến M15 cuối không đổi (cuối tuần / thị trường đóng cửa) thì không phân tích lại
+        newest = m15[-1]["time"]
         if newest == last_analyzed_candle:
             log.info("Không có nến mới (thị trường có thể đang đóng cửa), bỏ qua.")
             return
 
-        candle_text = format_candles(candles)
-        log.info("Dữ liệu gửi AI:\n%s", candle_text)
+        # H1 là phụ trợ: lỗi thì vẫn tiếp tục với M15, AI sẽ được báo là thiếu H1
+        h1 = fetch_candles("1h", H1_CANDLE_COUNT, 60)
+        if not h1:
+            log.warning("Không lấy được nến H1, tiếp tục phân tích chỉ với M15.")
 
-        signal = analyze_with_ai(candle_text)
+        m15_text = format_candles(m15)
+        h1_text = format_candles(h1) if h1 else None
+        log.info("Dữ liệu M15 gửi AI:\n%s", m15_text)
+        if h1:
+            log.info("Kèm %d nến H1 (từ %s đến %s GMT+7)", len(h1),
+                     h1[0]["time"].astimezone(VN_TZ).strftime("%d/%m %H:%M"),
+                     h1[-1]["time"].astimezone(VN_TZ).strftime("%d/%m %H:%M"))
+
+        signal = analyze_with_ai(m15_text, h1_text)
         if not signal:
             log.warning("AI không trả về kết quả, sẽ thử lại ở chu kỳ sau.")
             return
@@ -566,7 +592,8 @@ def validate_config():
 def main():
     validate_config()
     model = {"openai": OPENAI_MODEL, "anthropic": ANTHROPIC_MODEL}.get(LLM_PROVIDER, GEMINI_MODEL)
-    log.info("Bot XAUUSD khởi động | AI: %s (%s) | Nến: %d x M15", LLM_PROVIDER, model, CANDLE_COUNT)
+    log.info("Bot XAUUSD khởi động | AI: %s (%s) | Nến: %d x M15 + %d x H1",
+             LLM_PROVIDER, model, CANDLE_COUNT, H1_CANDLE_COUNT)
 
     # Chế độ GitHub Actions: chạy 1 lần rồi thoát, lịch do GitHub quản lý
     if RUN_ONCE:
