@@ -8,6 +8,11 @@ Luồng hoạt động (mỗi 15 phút, ngay sau khi nến M15 đóng):
     3. Gửi cho AI (Gemini miễn phí / Anthropic / OpenAI) kèm System Prompt
     4. Gửi kết quả về Telegram (parse_mode=HTML)
 
+Chốt sổ số dư qua Telegram:
+    - Gửi cho bot: /sodu 95.5   -> cập nhật số dư mới (bot ghim tin xác nhận để nhớ)
+    - Gửi cho bot: /sodu        -> xem số dư bot đang dùng
+    Lệnh được xử lý ở lượt chạy kế tiếp (tối đa ~15 phút).
+
 Hai chế độ chạy:
     - RUN_ONCE=true  : chạy 1 lần rồi thoát (dùng cho GitHub Actions, miễn phí)
     - RUN_ONCE=false : tự lặp mỗi 15 phút (dùng cho VPS / PythonAnywhere trả phí)
@@ -66,6 +71,11 @@ H1_CANDLE_COUNT = int(os.getenv("H1_CANDLE_COUNT", "50"))
 # false = chỉ gửi khi có BUY/SELL (đỡ spam)
 SEND_WAIT_SIGNALS = os.getenv("SEND_WAIT_SIGNALS", "true").strip().lower() == "true"
 
+# Quản trị vốn: số dư tài khoản (USD) và % rủi ro tối đa cho phép mỗi lệnh
+# ACCOUNT_BALANCE chỉ là số dư mặc định, dùng khi chưa chốt sổ qua Telegram (/sodu)
+ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "100"))
+MAX_RISK_PERCENT = float(os.getenv("MAX_RISK_PERCENT", "3"))
+
 # true = chạy 1 chu kỳ rồi thoát (GitHub Actions tự lên lịch thay cho vòng lặp)
 RUN_ONCE = os.getenv("RUN_ONCE", "false").strip().lower() == "true"
 
@@ -81,7 +91,7 @@ VN_TZ = timezone(timedelta(hours=7))
 # =============================================================================
 # SYSTEM PROMPT CHO AI (đã chuyển sang định dạng HTML của Telegram)
 # =============================================================================
-SYSTEM_PROMPT = """[SYSTEM ROLE]
+SYSTEM_PROMPT_TEMPLATE = """[SYSTEM ROLE]
 Bạn là một Nhà giao dịch Chuyên nghiệp (Professional Forex & Gold Futures Trader) với hơn 10 năm kinh nghiệm phân tích Price Action, nến Nhật và cấu trúc thị trường dành riêng cho cặp XAUUSD (Vàng).
 
 Nhiệm vụ của bạn là tiếp nhận dữ liệu giá OHLC, phân tích xu hướng hiện tại, đưa ra nhận định khách quan và xuất ra tín hiệu giao dịch tối ưu được đóng gói sẵn để gửi trực tiếp qua Telegram Bot.
@@ -113,7 +123,8 @@ Phân tích qua 4 bước:
    - Không bắt đỉnh/đáy nếu chưa có nến xác nhận đảo chiều.
    - Vốn rủi ro = Balance x Risk_% (mặc định 1% - 2%).
    - Lot Size = Vốn rủi ro / (Khoảng cách SL theo pip x 0.10 USD) x 0.01.
-   - Nếu Lot Size tính ra nhỏ hơn 0.01: dùng 0.01 lot và ghi rõ % rủi ro thực tế. Nếu rủi ro thực tế vượt 3% tài khoản, chuyển tín hiệu sang WAIT.
+   - Số dư tài khoản: __BALANCE__ USD. Rủi ro tối đa cho phép mỗi lệnh: __MAX_RISK__% tài khoản (= __MAX_RISK_USD__ USD).
+   - Nếu Lot Size tính ra nhỏ hơn 0.01: dùng 0.01 lot và ghi rõ % rủi ro thực tế. Nếu rủi ro thực tế vượt __MAX_RISK__% tài khoản, chuyển tín hiệu sang WAIT.
 
 4. Đánh giá Rủi ro:
    - THẤP: Thuận xu hướng chính + có nến xác nhận tại vùng cản cứng.
@@ -145,7 +156,7 @@ Mẫu bắt buộc:
 🎯 <b>Chốt lời 1 (TP1):</b> [giá TP1] (R:R = 1:1.5)
 🎯 <b>Chốt lời 2 (TP2):</b> [giá TP2] (R:R = 1:2 trở lên)
 
-⚖️ <b>QUẢN TRỊ VỐN ĐỀ XUẤT (Cho TK 100 USD):</b>
+⚖️ <b>QUẢN TRỊ VỐN ĐỀ XUẤT (Cho TK __BALANCE__ USD):</b>
 - <b>Khối lượng khuyến nghị:</b> [Lot Size]
 - <b>Mức lỗ tối đa khi chạm SL:</b> -$[số tiền] ([% tài khoản])
 - <b>Mức lãi kỳ vọng khi chạm TP1:</b> +$[số tiền]
@@ -153,6 +164,15 @@ Mẫu bắt buộc:
 ⚠️ <b>Mức độ rủi ro:</b> [THẤP / TRUNG BÌNH / CAO]
 💡 <b>Lưu ý kỷ luật:</b> [một câu nhắc quản lý tâm lý hoặc xử lý lệnh khi giá chạy được 50% TP]
 """
+
+
+def build_system_prompt(balance):
+    """Điền số dư hiện tại và mức rủi ro tối đa vào System Prompt."""
+    max_risk_usd = round(balance * MAX_RISK_PERCENT / 100, 2)
+    return (SYSTEM_PROMPT_TEMPLATE
+            .replace("__BALANCE__", f"{balance:g}")
+            .replace("__MAX_RISK_USD__", f"{max_risk_usd:g}")
+            .replace("__MAX_RISK__", f"{MAX_RISK_PERCENT:g}"))
 
 
 # =============================================================================
@@ -307,7 +327,7 @@ def build_user_message(m15_text, h1_text):
     )
 
 
-def call_anthropic(user_message):
+def call_anthropic(system_prompt, user_message):
     """Gọi Anthropic Messages API bằng requests. Trả về text hoặc None."""
     try:
         resp = http_request(
@@ -323,7 +343,7 @@ def call_anthropic(user_message):
             json={
                 "model": ANTHROPIC_MODEL,
                 "max_tokens": 1500,
-                "system": SYSTEM_PROMPT,
+                "system": system_prompt,
                 "messages": [{"role": "user", "content": user_message}],
             },
         )
@@ -345,7 +365,7 @@ def call_anthropic(user_message):
         return None
 
 
-def call_openai(user_message):
+def call_openai(system_prompt, user_message):
     """Gọi OpenAI Chat Completions API bằng requests. Trả về text hoặc None."""
     try:
         resp = http_request(
@@ -362,7 +382,7 @@ def call_openai(user_message):
                 "max_tokens": 1500,
                 "temperature": 0.3,
                 "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_message},
                 ],
             },
@@ -385,21 +405,21 @@ def call_openai(user_message):
         return None
 
 
-def call_gemini(user_message):
+def call_gemini(system_prompt, user_message):
     """
     Gọi lần lượt các model Gemini trong GEMINI_MODEL.
     Model đầu quá tải (503) hoặc không khả dụng (404) thì tự chuyển sang model tiếp theo.
     """
     models = [m.strip() for m in GEMINI_MODEL.split(",") if m.strip()]
     for model in models:
-        result = call_gemini_model(model, user_message)
+        result = call_gemini_model(model, system_prompt, user_message)
         if result:
             return result
         log.warning("[Gemini] Model %s không trả kết quả, thử model tiếp theo (nếu còn).", model)
     return None
 
 
-def call_gemini_model(model, user_message):
+def call_gemini_model(model, system_prompt, user_message):
     """Gọi 1 model Google Gemini (có gói miễn phí) bằng requests. Trả về text hoặc None."""
     try:
         resp = http_request(
@@ -412,7 +432,7 @@ def call_gemini_model(model, user_message):
                 "Content-Type": "application/json",
             },
             json={
-                "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+                "system_instruction": {"parts": [{"text": system_prompt}]},
                 "contents": [{"role": "user", "parts": [{"text": user_message}]}],
                 # Để dư token vì model Flash có "suy nghĩ" nội bộ, tốn thêm token đầu ra
                 "generationConfig": {"temperature": 0.3, "maxOutputTokens": 8192},
@@ -455,15 +475,16 @@ def clean_ai_output(text):
     return text.strip()
 
 
-def analyze_with_ai(m15_text, h1_text):
+def analyze_with_ai(m15_text, h1_text, balance):
     """Chọn nhà cung cấp AI theo cấu hình và trả về tín hiệu đã làm sạch."""
+    system_prompt = build_system_prompt(balance)
     user_message = build_user_message(m15_text, h1_text)
     if LLM_PROVIDER == "openai":
-        result = call_openai(user_message)
+        result = call_openai(system_prompt, user_message)
     elif LLM_PROVIDER == "anthropic":
-        result = call_anthropic(user_message)
+        result = call_anthropic(system_prompt, user_message)
     else:
-        result = call_gemini(user_message)
+        result = call_gemini(system_prompt, user_message)
     return clean_ai_output(result) if result else None
 
 
@@ -529,6 +550,129 @@ def send_telegram(text):
 
 
 # =============================================================================
+# CHỐT SỔ SỐ DƯ QUA TELEGRAM
+# Số dư được lưu bằng cách GHIM tin nhắn xác nhận trong chat -> không cần database,
+# GitHub Actions chạy lại từ đầu mỗi lần vẫn đọc được số dư qua getChat.
+# =============================================================================
+BALANCE_MARKER = "SỐ DƯ TÀI KHOẢN"
+BALANCE_CMD = re.compile(r"^/(?:sodu|balance)(?:@\w+)?(?:\s+(.+))?$", re.IGNORECASE)
+
+
+def tg_api(method, payload):
+    """Gọi 1 phương thức Telegram Bot API. Trả về trường 'result' hoặc None nếu lỗi."""
+    try:
+        resp = http_request("POST", f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}",
+                            f"Telegram {method}", json=payload)
+        if resp is None:
+            return None
+        data = resp.json()
+        if not data.get("ok"):
+            log.error("[Telegram %s] Lỗi: %s", method, data.get("description"))
+            return None
+        return data.get("result")
+    except ValueError:
+        log.error("[Telegram %s] Phản hồi không phải JSON.", method)
+        return None
+    except Exception:
+        log.exception("[Telegram %s] Lỗi không mong muốn", method)
+        return None
+
+
+def parse_amount(raw):
+    """Đổi chuỗi người dùng gõ thành số: '95.5', '95,5', '1,250.75', '$120' -> float."""
+    raw = raw.strip().replace("$", "").replace("USD", "").replace("usd", "").strip()
+    if "," in raw and "." in raw:
+        raw = raw.replace(",", "")          # 1,250.75 -> 1250.75
+    else:
+        raw = raw.replace(",", ".")         # 95,5 -> 95.5
+    return float(raw)
+
+
+def get_pinned_balance():
+    """Đọc số dư từ tin nhắn đang được ghim trong chat. Trả về float hoặc None."""
+    chat = tg_api("getChat", {"chat_id": TELEGRAM_CHAT_ID})
+    text = ((chat or {}).get("pinned_message") or {}).get("text", "")
+    m = re.search(BALANCE_MARKER + r"\D*?(\d+(?:\.\d+)?)", text)
+    return float(m.group(1)) if m else None
+
+
+def get_current_balance():
+    """Số dư dùng để tính lot: ưu tiên số đã chốt sổ, nếu chưa có thì dùng ACCOUNT_BALANCE."""
+    balance = get_pinned_balance()
+    if balance is None:
+        log.info("Chưa có số dư chốt sổ, dùng mặc định ACCOUNT_BALANCE = %g USD", ACCOUNT_BALANCE)
+        return ACCOUNT_BALANCE
+    log.info("Số dư theo chốt sổ gần nhất: %g USD", balance)
+    return balance
+
+
+def save_balance(balance):
+    """Gửi tin xác nhận số dư mới và ghim lại để các lượt chạy sau đọc được."""
+    now_vn = datetime.now(VN_TZ).strftime("%H:%M %d/%m/%Y")
+    max_risk_usd = round(balance * MAX_RISK_PERCENT / 100, 2)
+    text = (f"💰 <b>{BALANCE_MARKER}: {balance:g} USD</b>\n"
+            f"🕒 Chốt sổ lúc: {now_vn} (GMT+7)\n"
+            f"⚖️ Rủi ro tối đa mỗi lệnh: {MAX_RISK_PERCENT:g}% = {max_risk_usd:g} USD\n"
+            f"<i>Tin nhắn này đang được ghim để bot ghi nhớ số dư. Đừng bỏ ghim.</i>")
+    msg = tg_api("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"})
+    if not msg:
+        return False
+    pinned = tg_api("pinChatMessage", {"chat_id": TELEGRAM_CHAT_ID,
+                                       "message_id": msg["message_id"],
+                                       "disable_notification": True})
+    if pinned is None:
+        send_telegram("⚠️ Không ghim được tin chốt sổ. Hãy gửi lại lệnh /sodu kèm số dư.")
+        return False
+    log.info("Đã chốt sổ số dư mới: %g USD", balance)
+    return True
+
+
+def process_balance_commands():
+    """
+    Đọc các tin nhắn mới gửi cho bot, xử lý lệnh /sodu.
+    Chỉ nhận lệnh từ đúng TELEGRAM_CHAT_ID của bạn, người khác nhắn bot sẽ bị bỏ qua.
+    """
+    try:
+        updates = tg_api("getUpdates", {"timeout": 0, "allowed_updates": ["message"]})
+        if not updates:
+            return
+
+        new_balance, want_show, bad_input = None, False, None
+        for u in updates:
+            msg = u.get("message") or {}
+            if str(msg.get("chat", {}).get("id")) != str(TELEGRAM_CHAT_ID):
+                continue
+            m = BALANCE_CMD.match((msg.get("text") or "").strip())
+            if not m:
+                continue
+            if m.group(1):
+                try:
+                    value = parse_amount(m.group(1))
+                    if value <= 0:
+                        raise ValueError
+                    new_balance = value          # nhiều lệnh thì lấy lệnh mới nhất
+                except ValueError:
+                    bad_input = m.group(1)
+            else:
+                want_show = True
+
+        # Báo Telegram đã xử lý xong các tin này để lần sau không đọc lại
+        tg_api("getUpdates", {"offset": updates[-1]["update_id"] + 1, "timeout": 0})
+
+        if new_balance is not None:
+            save_balance(new_balance)
+        elif bad_input is not None:
+            send_telegram(f"⚠️ Không hiểu số dư <code>{html.escape(bad_input)}</code>. "
+                          "Gửi đúng dạng: <code>/sodu 95.5</code>")
+        elif want_show:
+            balance = get_current_balance()
+            send_telegram(f"💰 Số dư bot đang dùng để tính lot: <b>{balance:g} USD</b>\n"
+                          "Cập nhật bằng lệnh: <code>/sodu 95.5</code>")
+    except Exception:
+        log.exception("Lỗi khi xử lý lệnh chốt sổ")
+
+
+# =============================================================================
 # BƯỚC 4: JOB CHÍNH - chạy mỗi 15 phút
 # =============================================================================
 last_analyzed_candle = None   # Lưu thời gian nến cuối đã phân tích để tránh trùng lặp
@@ -539,6 +683,10 @@ def job():
     global last_analyzed_candle
     try:
         log.info("===== Bắt đầu chu kỳ phân tích =====")
+
+        # Xử lý lệnh chốt sổ /sodu (nếu có) rồi lấy số dư hiện tại
+        process_balance_commands()
+        balance = get_current_balance()
 
         # M15 là bắt buộc: không có thì bỏ qua chu kỳ
         m15 = fetch_candles("15min", CANDLE_COUNT, 15)
@@ -565,7 +713,7 @@ def job():
                      h1[0]["time"].astimezone(VN_TZ).strftime("%d/%m %H:%M"),
                      h1[-1]["time"].astimezone(VN_TZ).strftime("%d/%m %H:%M"))
 
-        signal = analyze_with_ai(m15_text, h1_text)
+        signal = analyze_with_ai(m15_text, h1_text, balance)
         if not signal:
             log.warning("AI không trả về kết quả, sẽ thử lại ở chu kỳ sau.")
             return
@@ -610,8 +758,8 @@ def validate_config():
 def main():
     validate_config()
     model = {"openai": OPENAI_MODEL, "anthropic": ANTHROPIC_MODEL}.get(LLM_PROVIDER, GEMINI_MODEL)
-    log.info("Bot XAUUSD khởi động | AI: %s (%s) | Nến: %d x M15 + %d x H1",
-             LLM_PROVIDER, model, CANDLE_COUNT, H1_CANDLE_COUNT)
+    log.info("Bot XAUUSD khởi động | AI: %s (%s) | Nến: %d x M15 + %d x H1 | Rủi ro tối đa %g%%/lệnh",
+             LLM_PROVIDER, model, CANDLE_COUNT, H1_CANDLE_COUNT, MAX_RISK_PERCENT)
 
     # Chế độ GitHub Actions: chạy 1 lần rồi thoát, lịch do GitHub quản lý
     if RUN_ONCE:
