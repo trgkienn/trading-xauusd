@@ -46,7 +46,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 # Chọn nhà cung cấp AI: "gemini" (miễn phí), "anthropic" hoặc "openai"
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+# Có thể khai báo nhiều model, cách nhau dấu phẩy: model đầu lỗi/quá tải sẽ tự chuyển sang model sau
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash,gemini-3.7-flash,gemini-3.5-flash-lite")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -186,8 +187,9 @@ def http_request(method, url, name, **kwargs):
         try:
             resp = requests.request(method, url, **kwargs)
             if resp.status_code in RETRY_STATUS:
-                log.warning("[%s] Server trả mã %s (lần %d/%d)",
-                            name, resp.status_code, attempt, MAX_RETRIES)
+                log.warning("[%s] Server trả mã %s (lần %d/%d): %s",
+                            name, resp.status_code, attempt, MAX_RETRIES,
+                            resp.text[:200].replace("\n", " "))
             else:
                 return resp
         except requests.Timeout:
@@ -384,12 +386,26 @@ def call_openai(user_message):
 
 
 def call_gemini(user_message):
-    """Gọi Google Gemini API (có gói miễn phí) bằng requests. Trả về text hoặc None."""
+    """
+    Gọi lần lượt các model Gemini trong GEMINI_MODEL.
+    Model đầu quá tải (503) hoặc không khả dụng (404) thì tự chuyển sang model tiếp theo.
+    """
+    models = [m.strip() for m in GEMINI_MODEL.split(",") if m.strip()]
+    for model in models:
+        result = call_gemini_model(model, user_message)
+        if result:
+            return result
+        log.warning("[Gemini] Model %s không trả kết quả, thử model tiếp theo (nếu còn).", model)
+    return None
+
+
+def call_gemini_model(model, user_message):
+    """Gọi 1 model Google Gemini (có gói miễn phí) bằng requests. Trả về text hoặc None."""
     try:
         resp = http_request(
             "POST",
-            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-            "Gemini",
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            f"Gemini {model}",
             timeout=LLM_TIMEOUT,
             headers={
                 "x-goog-api-key": GEMINI_API_KEY,
@@ -405,24 +421,26 @@ def call_gemini(user_message):
         if resp is None:
             return None
         if resp.status_code != 200:
-            log.error("[Gemini] HTTP %s: %s", resp.status_code, resp.text[:500])
+            log.error("[Gemini %s] HTTP %s: %s", model, resp.status_code, resp.text[:500])
             return None
 
         data = resp.json()
         candidates = data.get("candidates") or []
         if not candidates:
-            log.error("[Gemini] Không có kết quả trả về: %s", str(data)[:500])
+            log.error("[Gemini %s] Không có kết quả trả về: %s", model, str(data)[:500])
             return None
         parts = candidates[0].get("content", {}).get("parts", [])
         # Bỏ qua phần "thought" (nếu có), chỉ lấy câu trả lời
         text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+        if text.strip():
+            log.info("[Gemini] Model %s đã trả kết quả.", model)
         return text.strip() or None
 
     except (ValueError, KeyError, IndexError, TypeError) as e:
-        log.error("[Gemini] Phản hồi không đúng định dạng: %s", e)
+        log.error("[Gemini %s] Phản hồi không đúng định dạng: %s", model, e)
         return None
     except Exception:
-        log.exception("[Gemini] Lỗi không mong muốn")
+        log.exception("[Gemini %s] Lỗi không mong muốn", model)
         return None
 
 
